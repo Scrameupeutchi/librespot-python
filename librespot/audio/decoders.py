@@ -12,13 +12,13 @@ class AudioQuality(enum.Enum):
     NORMAL = 0x00
     HIGH = 0x01
     VERY_HIGH = 0x02
-    LOSSLESS = 0x03
 
     @staticmethod
     def get_quality(audio_format: AudioFile.Format) -> AudioQuality:
         if audio_format in [
                 AudioFile.MP3_96,
                 AudioFile.OGG_VORBIS_96,
+                AudioFile.AAC_24_NORM,
         ]:
             return AudioQuality.NORMAL
         if audio_format in [
@@ -35,12 +35,7 @@ class AudioQuality(enum.Enum):
                 AudioFile.AAC_48,
         ]:
             return AudioQuality.VERY_HIGH
-        if audio_format in [
-                AudioFile.FLAC_FLAC,
-                AudioFile.FLAC_FLAC_24BIT,
-        ]:
-            return AudioQuality.LOSSLESS
-        raise RuntimeError("Unknown format: {}".format(audio_format))
+        raise RuntimeError("Unknown format: {}".format(format))
 
     def get_matches(self,
                     files: typing.List[AudioFile]) -> typing.List[AudioFile]:
@@ -52,71 +47,35 @@ class AudioQuality(enum.Enum):
         return file_list
 
 
-class FormatOnlyAudioQuality(AudioQualityPicker):
-    # Generic quality picker; filters files by container format
-
-    logger = logging.getLogger("Librespot:Player:FormatOnlyAudioQuality")
+class VorbisOnlyAudioQuality(AudioQualityPicker):
+    logger = logging.getLogger("Librespot:Player:VorbisOnlyAudioQuality")
     preferred: AudioQuality
-    format_filter: SuperAudioFormat
 
-    def __init__(self, preferred: AudioQuality, format_filter: SuperAudioFormat):
+    def __init__(self, preferred: AudioQuality):
         self.preferred = preferred
-        self.format_filter = format_filter
 
     @staticmethod
-    def get_file_by_format(files: typing.List[Metadata.AudioFile],
-                           format_type: SuperAudioFormat) -> typing.Optional[Metadata.AudioFile]:
+    def get_vorbis_file(files: typing.List[Metadata.AudioFile]):
         for file in files:
             if file.HasField("format") and SuperAudioFormat.get(
-                    file.format) == format_type:
+                    file.format) == SuperAudioFormat.VORBIS:
                 return file
         return None
 
-    def get_file(self, files: typing.List[Metadata.AudioFile]) -> typing.Optional[Metadata.AudioFile]:
-        quality_matches: typing.List[Metadata.AudioFile] = self.preferred.get_matches(files)
-
-        selected_file = self.get_file_by_format(quality_matches, self.format_filter)
-
-        if selected_file is None:
-            # Try using any file matching the format, regardless of quality
-            selected_file = self.get_file_by_format(files, self.format_filter)
-
-            if selected_file is not None:
-                # Found format match (different quality than preferred)
+    def get_file(self, files: typing.List[Metadata.AudioFile]):
+        matches: typing.List[Metadata.AudioFile] = self.preferred.get_matches(
+            files)
+        vorbis: Metadata.AudioFile = VorbisOnlyAudioQuality.get_vorbis_file(
+            matches)
+        if vorbis is None:
+            vorbis: Metadata.AudioFile = VorbisOnlyAudioQuality.get_vorbis_file(
+                files)
+            if vorbis is not None:
                 self.logger.warning(
-                    "Using {} format file with {} quality because preferred {} quality couldn't be found.".format(
-                        self.format_filter.name,
-                        AudioQuality.get_quality(selected_file.format).name,
-                        self.preferred.name))
+                    "Using {} because preferred {} couldn't be found.".format(
+                        Metadata.AudioFile.Format.Name(vorbis.format),
+                        self.preferred))
             else:
-                available_formats = [SuperAudioFormat.get(f.format).name
-                                   for f in files if f.HasField("format")]
                 self.logger.fatal(
-                    "Couldn't find any {} file. Available formats: {}".format(
-                        self.format_filter.name,
-                        ", ".join(set(available_formats)) if available_formats else "none"))
-
-        return selected_file
-
-
-# Backward-compatible wrapper classes
-
-class VorbisOnlyAudioQuality(FormatOnlyAudioQuality):
-    logger = logging.getLogger("Librespot:Player:VorbisOnlyAudioQuality")
-
-    def __init__(self, preferred: AudioQuality):
-        super().__init__(preferred, SuperAudioFormat.VORBIS)
-
-    @staticmethod
-    def get_vorbis_file(files: typing.List[Metadata.AudioFile]) -> typing.Optional[Metadata.AudioFile]:
-        return FormatOnlyAudioQuality.get_file_by_format(files, SuperAudioFormat.VORBIS)
-
-class LosslessOnlyAudioQuality(FormatOnlyAudioQuality):
-    logger = logging.getLogger("Librespot:Player:LosslessOnlyAudioQuality")
-
-    def __init__(self, preferred: AudioQuality):
-        super().__init__(preferred, SuperAudioFormat.FLAC)
-
-    @staticmethod
-    def get_flac_file(files: typing.List[Metadata.AudioFile]) -> typing.Optional[Metadata.AudioFile]:
-        return FormatOnlyAudioQuality.get_file_by_format(files, SuperAudioFormat.FLAC)
+                    "Couldn't find any Vorbis file, available: {}")
+        return vorbis

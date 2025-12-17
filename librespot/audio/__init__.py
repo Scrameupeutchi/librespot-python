@@ -7,8 +7,8 @@ from librespot.cache import CacheManager
 from librespot.crypto import Packet
 from librespot.metadata import EpisodeId, PlayableId, TrackId
 from librespot.proto import Metadata_pb2 as Metadata, StorageResolve_pb2 as StorageResolve
-from librespot.structure import AudioDecrypt, AudioQualityPicker, Closeable, FeederException, GeneralAudioStream, GeneralWritableStream, HaltListener, NoopAudioDecrypt, PacketsReceiver
-from requests.structures import CaseInsensitiveDict
+from librespot.structure import GeneralAudioStream, AudioDecrypt, AudioQualityPicker, Closeable, FeederException, GeneralAudioStream, GeneralWritableStream, HaltListener, NoopAudioDecrypt, PacketsReceiver
+from pathlib import Path
 import concurrent.futures
 import io
 import logging
@@ -20,10 +20,48 @@ import threading
 import time
 import typing
 import urllib.parse
-
+import os
+import json
+import requests
 if typing.TYPE_CHECKING:
     from librespot.core import Session
 
+"""
+PATCH : SpotiClub Audio Key Fetching (v0.2.0)
+Fetches the audio decryption key from the SpotiClub Audio Key API instead of Spotify directly.
+This is a workaround for Spotify's tightened restrictions on Audio Key access (they allow only Premium Tier now).
+
+If you are using our fork, there is no reason for you to complete this section, as upon first run, Zotify will ask you for the logins and save them for future use.
+But if needed somehow or by using this single patch file, there are 3 importants parameters to provide, and one is already filled in:
+- server_url: The URL of the SpotiClub Audio Key API endpoint. You should not need to change this, except if a dev instructs you to do so.
+- spoticlub_user : Your SpotiClub FTP username. You can get this by using our Padoru Asssistant once.
+- spoticlub_password : Your SpotiClub FTP password, also obtainable via the Padoru Assistant.
+
+Using the fork's assistant is the recommended way to get register your credentials, as overwriting this file during the beta phase will need you to put them here over and over again.
+"""
+##### WRITE YOUR LOGINS DOWN HERE #####
+#######################################
+server_url = "http://api.spoticlub.zip:4277/get_audio_key"
+spoticlub_user = "anonymous"
+spoticlub_password = "IfWeFeelLikeEnablingThis"
+########################################
+##### END OF USER INPUT AREA ###########
+
+### SPOTICLUB CLIENT SERIAL TRACKING (DO NOT EDIT) ###
+spoticlub_client_serial: typing.Optional[str] = None
+spoticlub_loaded_logged: bool = False
+########################################
+
+class LoadedStream(GeneralAudioStream):
+    def __init__(self, data: bytes):
+        super().__init__()
+        self._buffer = io.BytesIO(data)
+
+    def read(self, n: int = -1) -> bytes:
+        return self._buffer.read(n)
+
+    def close(self) -> None:
+        self._buffer.close()
 
 class AbsChunkedInputStream(io.BytesIO, HaltListener):
     chunk_exception = None
@@ -232,6 +270,7 @@ class AudioKeyManager(PacketsReceiver, Closeable):
     __seq_holder_lock = threading.Condition()
     __session: Session
     __zero_short = b"\x00\x00"
+    _spoticlub_current_country: typing.Optional[str] = None
 
     def __init__(self, session: Session):
         self.__session = session
@@ -259,27 +298,114 @@ class AudioKeyManager(PacketsReceiver, Closeable):
                       gid: bytes,
                       file_id: bytes,
                       retry: bool = True) -> bytes:
-        seq: int
-        with self.__seq_holder_lock:
-            seq = self.__seq_holder
-            self.__seq_holder += 1
-        out = io.BytesIO()
-        out.write(file_id)
-        out.write(gid)
-        out.write(struct.pack(">i", seq))
-        out.write(self.__zero_short)
-        out.seek(0)
-        self.__session.send(Packet.Type.request_key, out.read())
-        callback = AudioKeyManager.SyncCallback(self)
-        self.__callbacks[seq] = callback
-        key = callback.wait_response()
-        if key is None:
-            if retry:
-                return self.get_audio_key(gid, file_id, False)
-            raise RuntimeError(
-                "Failed fetching audio key! gid: {}, fileId: {}".format(
-                    util.bytes_to_hex(gid), util.bytes_to_hex(file_id)))
-        return key
+        global spoticlub_user, spoticlub_password, spoticlub_client_serial, spoticlub_loaded_logged
+        if not spoticlub_user or not spoticlub_password or spoticlub_user == "anonymous":
+            try:
+                # To verify : Do all forks look for the same path ?
+                cfg_path = Path.home() / "AppData\\Roaming\\Zotify\\spoticlub_credentials.json"
+                if cfg_path.is_file():
+                    print(f"\n[SpotiClub API] Loading credentials...")
+                    with open(cfg_path, "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    spoticlub_user =  cfg.get("spoticlub_user")
+                    spoticlub_password = cfg.get("spoticlub_password")
+                else:
+                    print(f"[SpotiClub API] Credentials file NOT found at: {cfg_path}. We will proceed with hardcoded credentials if any...\n")
+            except Exception as exc:
+                print(f"[SpotiClub API] Error while loading credentials file: {exc}\n")
+
+        if not spoticlub_user or not spoticlub_password or not server_url:
+            cfg_path = Path.home() / "AppData\\Roaming\\Zotify\\spoticlub_credentials.json"
+            msg = (
+                "Missing SpotiClub credentials: please set the appropriates values inside your spoticlub_credentials.json,"
+                f"located in the Zotify config folder [{cfg_path}] (Or delete it and restart Zotify to be prompted for credentials)."
+            )
+            print(f"[SpotiClub API][ERROR]\n{msg}")
+            raise SystemExit(1)
+
+        if not spoticlub_loaded_logged:
+            spoticlub_loaded_logged = True
+            print(f"\n[SpotiClub API] Plugin Loaded! Welcome {spoticlub_user}\n")
+
+        payload = {
+            "gid": util.bytes_to_hex(gid),
+            "file_id": util.bytes_to_hex(file_id),
+            "user": spoticlub_user,
+            "password": spoticlub_password,
+        }
+        if spoticlub_client_serial:
+            payload["client_serial"] = spoticlub_client_serial
+
+        tries = 0
+        last_err: typing.Optional[Exception] = None
+
+        while True:
+            tries += 1
+            try:
+                resp = requests.post(server_url, json=payload, timeout=AudioKeyManager.audio_key_request_timeout)
+
+                # If another client instance is already active for this
+                # SpotiClub user, the server will reply with HTTP 423 and
+                # instruct this client to wait before retrying.
+                if resp.status_code == 423:
+                    try:
+                        data = resp.json()
+                    except Exception:  # noqa: BLE001
+                        data = {}
+                    retry_after = data.get("retry_after", 60)
+                    if not isinstance(retry_after, (int, float)):
+                        retry_after = 10
+                    print(
+                        f"[SpotiClub API] Another client is already using this account. Waiting {int(retry_after)}s before retrying..."
+                    )
+                    self.logger.info(
+                        "[SpotiClub API] Queued client for user %s; waiting %ds before retry",
+                        spoticlub_user,
+                        int(retry_after),
+                    )
+                    time.sleep(float(retry_after))
+                    # Do NOT count this as a failure towards the max retries.
+                    continue
+
+                # Explicit handling for bad logins so we don't just retry.
+                if resp.status_code == 401:
+                    print(
+                        "[SpotiClub API][BAD_LOGIN] It seems your credentials aren't recognized by the API. Please ensure you have entered them correctly, or contact a DEV if you are absolutely certain of their validity."
+                    )
+                    raise SystemExit(1)
+
+                if resp.status_code != 200:
+                    raise RuntimeError(f"[SpotiClub API] Sorry, the API returned the unexpected code {resp.status_code}: {resp.text}")
+
+                data = resp.json()
+                key_hex = data.get("key")
+                if not isinstance(key_hex, str):
+                    raise RuntimeError("[SpotiClub API] Sorry, API response missing 'key'")
+
+                country = data.get("country")
+                if isinstance(country, str):
+                    if AudioKeyManager._spoticlub_current_country != country:
+                        AudioKeyManager._spoticlub_current_country = country
+                        print(f"[SpotiClub API] Received {country} as the download country\n\n")
+
+                new_serial = data.get("client_serial")
+                if isinstance(new_serial, str) and new_serial:
+                    spoticlub_client_serial = new_serial
+
+                key_bytes = util.hex_to_bytes(key_hex)
+                if len(key_bytes) != 16:
+                    raise RuntimeError("[SpotiClub API] Woops, received Audio Key must be 16 bytes long")
+                return key_bytes
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+                self.logger.warning("[SpotiClub API] Retrying the contact... (try %d): %s", tries, exc)
+                if not retry or tries >= 3:
+                    break
+                time.sleep(5)
+
+        raise RuntimeError(
+            "Failed fetching Audio Key from API for gid: {}, fileId: {} (last error: {})".format(
+                util.bytes_to_hex(gid), util.bytes_to_hex(file_id), last_err))
 
     class Callback:
 
@@ -331,7 +457,7 @@ class CdnFeedHelper:
             session: Session, track: Metadata.Track, file: Metadata.AudioFile,
             resp_or_url: typing.Union[StorageResolve.StorageResolveResponse,
                                       str], preload: bool,
-            halt_listener: HaltListener) -> LoadedStream:
+            halt_listener: HaltListener) -> PlayableContentFeeder.LoadedStream:
         if type(resp_or_url) is str:
             url = resp_or_url
         else:
@@ -345,17 +471,18 @@ class CdnFeedHelper:
         normalization_data = NormalizationData.read(input_stream)
         if input_stream.skip(0xA7) != 0xA7:
             raise IOError("Couldn't skip 0xa7 bytes!")
-        return LoadedStream(
+        return PlayableContentFeeder.LoadedStream(
             track,
             streamer,
             normalization_data,
-            file.file_id, preload, audio_key_time
+            PlayableContentFeeder.Metrics(file.file_id, preload,
+                                          -1 if preload else audio_key_time),
         )
 
     @staticmethod
     def load_episode_external(
             session: Session, episode: Metadata.Episode,
-            halt_listener: HaltListener) -> LoadedStream:
+            halt_listener: HaltListener) -> PlayableContentFeeder.LoadedStream:
         resp = session.client().head(episode.external_url)
 
         if resp.status_code != 200:
@@ -367,11 +494,11 @@ class CdnFeedHelper:
 
         streamer = session.cdn().stream_external_episode(
             episode, url, halt_listener)
-        return LoadedStream(
+        return PlayableContentFeeder.LoadedStream(
             episode,
             streamer,
             None,
-            None, False, -1
+            PlayableContentFeeder.Metrics(None, False, -1),
         )
 
     @staticmethod
@@ -382,7 +509,7 @@ class CdnFeedHelper:
         resp_or_url: typing.Union[StorageResolve.StorageResolveResponse, str],
         preload: bool,
         halt_listener: HaltListener,
-    ) -> LoadedStream:
+    ) -> PlayableContentFeeder.LoadedStream:
         if type(resp_or_url) is str:
             url = resp_or_url
         else:
@@ -396,11 +523,12 @@ class CdnFeedHelper:
         normalization_data = NormalizationData.read(input_stream)
         if input_stream.skip(0xA7) != 0xA7:
             raise IOError("Couldn't skip 0xa7 bytes!")
-        return LoadedStream(
+        return PlayableContentFeeder.LoadedStream(
             episode,
             streamer,
             normalization_data,
-            file.file_id, preload, audio_key_time
+            PlayableContentFeeder.Metrics(file.file_id, preload,
+                                          -1 if preload else audio_key_time),
         )
 
 
@@ -470,9 +598,9 @@ class CdnManager:
 
     class InternalResponse:
         buffer: bytes
-        headers: CaseInsensitiveDict[str, str]
+        headers: typing.Dict[str, str]
 
-        def __init__(self, buffer: bytes, headers: CaseInsensitiveDict[str, str]):
+        def __init__(self, buffer: bytes, headers: typing.Dict[str, str]):
             self.buffer = buffer
             self.headers = headers
 
@@ -578,6 +706,8 @@ class CdnManager:
                                     range_end=ChannelManager.chunk_size - 1)
             content_range = response.headers.get("Content-Range")
             if content_range is None:
+                content_range = response.headers.get("content-range")
+            if content_range is None:
                 raise IOError("Missing Content-Range header!")
             split = content_range.split("/")
             self.size = int(split[1])
@@ -630,16 +760,16 @@ class CdnManager:
                 range_end = (chunk + 1) * ChannelManager.chunk_size - 1
             response = self.__session.client().get(
                 self.__cdn_url.url,
-                headers=CaseInsensitiveDict({
+                headers={
                     "Range": "bytes={}-{}".format(range_start, range_end)
-                }),
+                },
             )
             if response.status_code != 206:
                 raise IOError(response.status_code)
             body = response.content
             if body is None:
                 raise IOError("Response body is empty!")
-            return CdnManager.InternalResponse(body, response.headers)
+            return CdnManager.InternalResponse(body, dict(response.headers))
 
         class InternalStream(AbsChunkedInputStream):
             streamer: CdnManager.Streamer
@@ -746,9 +876,7 @@ class PlayableContentFeeder:
                     episode: Metadata.Episode, preload: bool,
                     halt_lister: HaltListener):
         if track is None and episode is None:
-            raise RuntimeError("No content passed!")
-        elif file is None:
-            raise RuntimeError("Content has no audio file!")
+            raise RuntimeError()
         response = self.resolve_storage_interactive(file.file_id, preload)
         if response.result == StorageResolve.StorageResolveResponse.Result.CDN:
             if track is not None:
@@ -778,27 +906,50 @@ class PlayableContentFeeder:
             self.logger.fatal(
                 "Couldn't find any suitable audio file, available: {}".format(
                     episode.audio))
-            raise FeederException("Cannot find suitable audio file")
         return self.load_stream(file, None, episode, preload, halt_listener)
 
     def load_track(self, track_id_or_track: typing.Union[TrackId,
                                                          Metadata.Track],
                    audio_quality_picker: AudioQualityPicker, preload: bool,
                    halt_listener: HaltListener):
-        if type(track_id_or_track) is TrackId:
-            original = self.__session.api().get_metadata_4_track(
-                track_id_or_track)
+        if isinstance(track_id_or_track, TrackId):
+            track_id = track_id_or_track
+            original = self.__session.api().get_metadata_4_track(track_id)
+
+            if len(original.file) == 0:
+                self._populate_track_files_from_extended_metadata(track_id, original)
+
+            if len(original.file) == 0:
+                for alt in original.alternative:
+                    if len(alt.file) > 0 or not alt.gid:
+                        continue
+                    gid_hex = util.bytes_to_hex(alt.gid)
+                    if len(gid_hex) != 32:
+                        continue
+                    try:
+                        alt_track_id = TrackId.from_hex(gid_hex)
+                    except Exception:
+                        continue
+                    self._populate_track_files_from_extended_metadata(alt_track_id, alt)
+
             track = self.pick_alternative_if_necessary(original)
             if track is None:
                 raise RuntimeError("Cannot get alternative track")
         else:
             track = track_id_or_track
+            try:
+                gid_hex = util.bytes_to_hex(track.gid)
+                input_track_id = TrackId.from_hex(gid_hex) if len(gid_hex) == 32 else None
+            except Exception:
+                input_track_id = None
+            if input_track_id is not None and len(track.file) == 0:
+                self._populate_track_files_from_extended_metadata(input_track_id, track)
         file = audio_quality_picker.get_file(track.file)
         if file is None:
             self.logger.fatal(
                 "Couldn't find any suitable audio file, available: {}".format(
                     track.file))
-            raise FeederException("Cannot find suitable audio file")
+            raise FeederException()
         return self.load_stream(file, track, None, preload, halt_listener)
 
     def pick_alternative_if_necessary(
@@ -829,6 +980,45 @@ class PlayableContentFeeder:
                     licensor=track.licensor)
         return None
 
+    def _populate_track_files_from_extended_metadata(
+            self, track_id: TrackId, track_proto: Metadata.Track) -> bool:
+        if len(track_proto.file) > 0:
+            return True
+        try:
+            extension = self.__session.api().get_audio_files_extension(track_id)
+        except Exception as exc:  # pragma: no cover - network errors handled elsewhere
+            self.logger.debug(
+                "Extended metadata lookup failed for %s: %s",
+                track_id.to_spotify_uri(),
+                exc,
+            )
+            return False
+        if extension is None or len(extension.files) == 0:
+            return len(track_proto.file) > 0
+
+        existing_ids = {util.bytes_to_hex(audio.file_id) for audio in track_proto.file}
+        added_count = 0
+
+        for ext_file in extension.files:
+            if not ext_file.HasField("file"):
+                continue
+            file_id_bytes = ext_file.file.file_id
+            file_id_hex = util.bytes_to_hex(file_id_bytes)
+            if file_id_hex in existing_ids:
+                continue
+            track_proto.file.add().CopyFrom(ext_file.file)
+            existing_ids.add(file_id_hex)
+            added_count += 1
+
+        if added_count:
+            self.logger.debug(
+                "Enriched %s with %d file(s) from extended metadata",
+                track_id.to_spotify_uri(),
+                added_count,
+            )
+
+        return len(track_proto.file) > 0
+
     def resolve_storage_interactive(
             self, file_id: bytes,
             preload: bool) -> StorageResolve.StorageResolveResponse:
@@ -849,13 +1039,29 @@ class PlayableContentFeeder:
         storage_resolve_response.ParseFromString(body)
         return storage_resolve_response
 
+    class LoadedStream:
+        episode: Metadata.Episode
+        track: Metadata.Track
+        input_stream: GeneralAudioStream
+        normalization_data: NormalizationData
+        metrics: PlayableContentFeeder.Metrics
 
-class LoadedStream:
-    episode: Metadata.Episode
-    track: Metadata.Track
-    input_stream: GeneralAudioStream
-    normalization_data: NormalizationData
-    metrics: Metrics
+        def __init__(self, track_or_episode: typing.Union[Metadata.Track,
+                                                          Metadata.Episode],
+                     input_stream: GeneralAudioStream,
+                     normalization_data: typing.Union[NormalizationData, None],
+                     metrics: PlayableContentFeeder.Metrics):
+            if type(track_or_episode) is Metadata.Track:
+                self.track = track_or_episode
+                self.episode = None
+            elif type(track_or_episode) is Metadata.Episode:
+                self.track = None
+                self.episode = track_or_episode
+            else:
+                raise TypeError()
+            self.input_stream = input_stream
+            self.normalization_data = normalization_data
+            self.metrics = metrics
 
     class Metrics:
         file_id: str
@@ -863,27 +1069,13 @@ class LoadedStream:
         audio_key_time: int
 
         def __init__(self, file_id: typing.Union[bytes, None],
-                        preloaded_audio_key: bool, audio_key_time: int):
+                     preloaded_audio_key: bool, audio_key_time: int):
             self.file_id = None if file_id is None else util.bytes_to_hex(
                 file_id)
             self.preloaded_audio_key = preloaded_audio_key
-            self.audio_key_time = -1 if preloaded_audio_key else audio_key_time
-
-    def __init__(self, track_or_episode: typing.Union[Metadata.Track, Metadata.Episode],
-                    input_stream: GeneralAudioStream,
-                    normalization_data: typing.Union[NormalizationData, None],
-                    file_id: str, preloaded_audio_key: bool, audio_key_time: int):
-        if type(track_or_episode) is Metadata.Track:
-            self.track = track_or_episode
-            self.episode = None
-        elif type(track_or_episode) is Metadata.Episode:
-            self.track = None
-            self.episode = track_or_episode
-        else:
-            raise TypeError()
-        self.input_stream = input_stream
-        self.normalization_data = normalization_data
-        self.metrics = self.Metrics(file_id, preloaded_audio_key, audio_key_time)
+            self.audio_key_time = audio_key_time
+            if preloaded_audio_key and audio_key_time != -1:
+                raise RuntimeError()
 
 
 class StreamId:
